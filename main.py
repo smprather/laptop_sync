@@ -50,6 +50,19 @@ def _scp_opts(port: int) -> list[str]:
     return ["-P", str(port)] + _multiplex_opts()
 
 
+def _scp_remote_path(host: str, path: str) -> str:
+    """Build the host:path argument for scp, quoting appropriately per platform.
+
+    Windows OpenSSH uses SFTP mode by default, so the remote path is sent
+    literally (not through a remote shell) and must NOT be shell-quoted.
+    Unix scp may use legacy mode where the path goes through a remote shell,
+    so shell quoting is needed to handle spaces and special characters.
+    """
+    if sys.platform == "win32":
+        return f"{host}:{path}"
+    return f"{host}:{shlex.quote(path)}"
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -226,7 +239,7 @@ def copy_files(
 
     for rel in files:
         local_path = source / rel
-        remote_path = f"{host}:{shlex.quote(posixpath.join(dest, rel))}"
+        remote_path = _scp_remote_path(host, posixpath.join(dest, rel))
         console.print(f"  [cyan]copying[/cyan] {rel}")
         cmd = ["scp", "-p", *_scp_opts(port), str(local_path), remote_path]
         debug(f"scp cmd: {' '.join(cmd)}")
