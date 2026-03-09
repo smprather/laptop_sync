@@ -15,7 +15,7 @@ Key flow: poll loop → check host reachability → compute local snapshot (mtim
 
 Config is loaded from YAML (`laptop_sync.yaml` default), with CLI flags as overrides. Exclude patterns are YAML-only (no CLI flag).
 
-SSH connection multiplexing (`ControlMaster`) is used across all ssh/scp calls to avoid per-file handshake overhead. Host reachability is checked each cycle so the tool survives VPN delays or drops without crashing.
+SSH connection multiplexing (`ControlMaster`) is used on Unix to avoid per-file handshake overhead; on Windows it is automatically disabled since OpenSSH for Windows does not support Unix domain sockets. Host reachability is checked each cycle so the tool survives VPN delays or drops without crashing.
 
 ## Workflow
 
@@ -26,7 +26,7 @@ SSH connection multiplexing (`ControlMaster`) is used across all ssh/scp calls t
 - Use `scp` for file transfer and `ssh` for remote commands — no rsync, no SFTP
 - Use `shlex.quote()` on all remote paths passed through SSH
 - Batch remote operations (mkdir, rm) into single SSH calls to minimize roundtrips
-- Use SSH connection multiplexing (`ControlMaster`/`ControlPersist`) on all ssh/scp calls
+- Use SSH connection multiplexing (`ControlMaster`/`ControlPersist`) on Unix; auto-disabled on Windows
 - Check host reachability before each poll cycle; skip gracefully if unreachable
 - Catch `CalledProcessError` inside the loop to survive transient SSH failures
 - Compare files by mtime + size, never by content hash

@@ -5,6 +5,7 @@ import os
 import posixpath
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -16,6 +17,7 @@ console = Console()
 
 DEFAULT_CONFIG = "laptop_sync.yaml"
 _CONTROL_PATH = "~/.ssh/laptop-sync-%C"
+_CAN_MULTIPLEX = sys.platform != "win32"
 _verbose = False
 
 
@@ -25,10 +27,11 @@ def debug(msg: str) -> None:
         console.print(f"[dim][DEBUG] {msg}[/dim]")
 
 
-def _ssh_opts(port: int) -> list[str]:
-    """SSH options with port and connection multiplexing."""
+def _multiplex_opts() -> list[str]:
+    """SSH multiplexing options (Unix only, no-op on Windows)."""
+    if not _CAN_MULTIPLEX:
+        return []
     return [
-        "-p", str(port),
         "-o", f"ControlPath={_CONTROL_PATH}",
         "-o", "ControlMaster=auto",
         "-o", "ControlPersist=60",
@@ -37,14 +40,14 @@ def _ssh_opts(port: int) -> list[str]:
     ]
 
 
+def _ssh_opts(port: int) -> list[str]:
+    """SSH options with port and connection multiplexing."""
+    return ["-p", str(port)] + _multiplex_opts()
+
+
 def _scp_opts(port: int) -> list[str]:
     """SCP options with port and connection multiplexing."""
-    return [
-        "-P", str(port),
-        "-o", f"ControlPath={_CONTROL_PATH}",
-        "-o", "ControlMaster=auto",
-        "-o", "ControlPersist=60",
-    ]
+    return ["-P", str(port)] + _multiplex_opts()
 
 
 def load_config(path: str) -> dict:
@@ -308,7 +311,10 @@ def mirror(
     console.print(f"[dim]Poll interval: {poll_interval}s | SSH port: {port}[/dim]")
     if excludes:
         console.print(f"[dim]Excludes: {', '.join(excludes)}[/dim]")
-    debug(f"mtime_tolerance={tolerance}s, control_path={_CONTROL_PATH}")
+    debug(
+        f"mtime_tolerance={tolerance}s, "
+        f"ssh_multiplexing={'ON (' + _CONTROL_PATH + ')' if _CAN_MULTIPLEX else 'OFF (Windows)'}"
+    )
 
     remote_dir_ensured = False
     previous_local_snapshot: dict[str, tuple[float, int]] | None = None
