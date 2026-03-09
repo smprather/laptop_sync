@@ -16,6 +16,13 @@ console = Console()
 
 DEFAULT_CONFIG = "laptop_sync.yaml"
 _CONTROL_PATH = "~/.ssh/laptop-sync-%C"
+_verbose = False
+
+
+def debug(msg: str) -> None:
+    """Print a debug message when verbose mode is enabled."""
+    if _verbose:
+        console.print(f"[dim][DEBUG] {msg}[/dim]")
 
 
 def _ssh_opts(port: int) -> list[str]:
@@ -47,18 +54,26 @@ def load_config(path: str) -> dict:
 
 def check_host_reachable(host: str, port: int) -> bool:
     """Quick SSH connectivity check with short timeout."""
+    cmd = ["ssh"] + _ssh_opts(port) + [
+        "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes",
+        host, "true",
+    ]
+    debug(f"Reachability check: {' '.join(cmd)}")
     try:
-        result = subprocess.run(
-            ["ssh"] + _ssh_opts(port) + [
-                "-o", "ConnectTimeout=5",
-                "-o", "BatchMode=yes",
-                host, "true",
-            ],
-            capture_output=True,
-            timeout=15,
+        t0 = time.monotonic()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        elapsed = time.monotonic() - t0
+        reachable = result.returncode == 0
+        debug(
+            f"Reachability result: {'OK' if reachable else 'FAILED'} "
+            f"(rc={result.returncode}, {elapsed:.2f}s)"
         )
-        return result.returncode == 0
+        if not reachable and result.stderr.strip():
+            debug(f"Reachability stderr: {result.stderr.strip()}")
+        return reachable
     except subprocess.TimeoutExpired:
+        debug("Reachability check timed out")
         return False
 
 
@@ -68,6 +83,9 @@ def compute_local_snapshot(
     """Walk the source directory and return {relative_posix_path: (mtime, size)}."""
     excludes = excludes or []
     snapshot = {}
+    t0 = time.monotonic()
+    excluded_dirs = 0
+    excluded_files = 0
     for root, dirs, files in os.walk(source):
         rel_root = Path(root).relative_to(source).as_posix()
         if rel_root == ".":
@@ -75,10 +93,14 @@ def compute_local_snapshot(
 
         # Prune excluded directories in-place to avoid descending into them
         if excludes:
+            before = len(dirs)
             dirs[:] = [
                 d for d in dirs
                 if not any(fnmatch.fnmatch(d, pat) for pat in excludes)
             ]
+            pruned = before - len(dirs)
+            if pruned:
+                excluded_dirs += pruned
         dirs.sort()
 
         for fname in sorted(files):
@@ -87,10 +109,17 @@ def compute_local_snapshot(
                 fnmatch.fnmatch(fname, pat) or fnmatch.fnmatch(rel, pat)
                 for pat in excludes
             ):
+                excluded_files += 1
                 continue
             file_path = Path(root) / fname
             st = file_path.stat()
             snapshot[rel] = (st.st_mtime, st.st_size)
+
+    elapsed = time.monotonic() - t0
+    debug(
+        f"Local snapshot: {len(snapshot)} files in {elapsed:.3f}s"
+        f" (excluded {excluded_dirs} dirs, {excluded_files} files)"
+    )
     return snapshot
 
 
@@ -107,7 +136,11 @@ def compute_remote_snapshot(
         host,
         f"find {shlex.quote(dest)} -type f -printf '%T@ %s %p\\0'",
     ]
+    debug(f"Remote snapshot cmd: {' '.join(cmd)}")
+    t0 = time.monotonic()
     result = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = time.monotonic() - t0
+    debug(f"Remote snapshot SSH completed in {elapsed:.3f}s (rc={result.returncode})")
     if result.returncode != 0:
         if result.stderr.strip():
             console.print(
@@ -117,18 +150,24 @@ def compute_remote_snapshot(
 
     dest_prefix = dest.rstrip("/") + "/"
     snapshot = {}
+    skipped = 0
     for entry in result.stdout.split("\0"):
         if not entry:
             continue
         parts = entry.split(None, 2)
         if len(parts) != 3:
+            skipped += 1
+            debug(f"Remote snapshot: skipped unparseable entry: {entry!r}")
             continue
         mtime_str, size_str, abs_path = parts
         if abs_path.startswith(dest_prefix):
             rel = abs_path[len(dest_prefix):]
         else:
+            skipped += 1
             continue
         snapshot[rel] = (float(mtime_str), int(size_str))
+
+    debug(f"Remote snapshot: {len(snapshot)} files parsed, {skipped} entries skipped")
     return snapshot
 
 
@@ -142,11 +181,26 @@ def compute_diff(
     for rel, (l_mtime, l_size) in local.items():
         if rel not in remote:
             to_copy.append(rel)
+            debug(f"Diff: new file: {rel}")
         else:
             r_mtime, r_size = remote[rel]
-            if l_size != r_size or abs(l_mtime - r_mtime) > mtime_tolerance:
+            size_diff = l_size != r_size
+            mtime_diff = abs(l_mtime - r_mtime)
+            if size_diff or mtime_diff > mtime_tolerance:
                 to_copy.append(rel)
+                debug(
+                    f"Diff: changed: {rel} "
+                    f"(size {'DIFFERS' if size_diff else 'same'}: "
+                    f"local={l_size} remote={r_size}, "
+                    f"mtime delta={mtime_diff:.1f}s)"
+                )
     to_delete = [rel for rel in remote if rel not in local]
+    for rel in to_delete:
+        debug(f"Diff: to delete (not in local): {rel}")
+    debug(
+        f"Diff result: {len(to_copy)} to copy, {len(to_delete)} to delete "
+        f"(local={len(local)}, remote={len(remote)})"
+    )
     return to_copy, to_delete
 
 
@@ -163,18 +217,19 @@ def copy_files(
         mkdir_cmd = " && ".join(
             f"mkdir -p {shlex.quote(posixpath.join(dest, d))}" for d in sorted(dirs)
         )
-        subprocess.run(
-            ["ssh", *_ssh_opts(port), host, mkdir_cmd], check=True,
-        )
+        cmd = ["ssh", *_ssh_opts(port), host, mkdir_cmd]
+        debug(f"Creating {len(dirs)} remote dirs: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
 
     for rel in files:
         local_path = source / rel
         remote_path = f"{host}:{shlex.quote(posixpath.join(dest, rel))}"
         console.print(f"  [cyan]copying[/cyan] {rel}")
-        subprocess.run(
-            ["scp", "-p", *_scp_opts(port), str(local_path), remote_path],
-            check=True,
-        )
+        cmd = ["scp", "-p", *_scp_opts(port), str(local_path), remote_path]
+        debug(f"scp cmd: {' '.join(cmd)}")
+        t0 = time.monotonic()
+        subprocess.run(cmd, check=True)
+        debug(f"scp completed in {time.monotonic() - t0:.3f}s")
 
 
 def delete_remote_files(
@@ -190,18 +245,19 @@ def delete_remote_files(
         rm_cmd = " && ".join(
             f"rm -f {shlex.quote(posixpath.join(dest, f))}" for f in batch
         )
-        subprocess.run(["ssh", *_ssh_opts(port), host, rm_cmd], check=True)
+        cmd = ["ssh", *_ssh_opts(port), host, rm_cmd]
+        debug(f"rm batch {i // batch_size + 1}: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
         for f in batch:
             console.print(f"  [red]deleted[/red] {f}")
 
     # Clean up empty directories
-    subprocess.run(
-        [
-            "ssh", *_ssh_opts(port), host,
-            f"find {shlex.quote(dest)} -type d -empty -delete",
-        ],
-        check=True,
-    )
+    cmd = [
+        "ssh", *_ssh_opts(port), host,
+        f"find {shlex.quote(dest)} -type d -empty -delete",
+    ]
+    debug(f"Cleaning empty dirs: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
 
 @click.command()
@@ -217,6 +273,7 @@ def delete_remote_files(
 @click.option("--interval", default=None, type=int, help="Override poll interval (seconds).")
 @click.option("--ssh-port", default=None, type=int, help="Override SSH port.")
 @click.option("--mtime-tolerance", default=None, type=float, help="Override mtime tolerance (seconds).")
+@click.option("-v", "--verbose", is_flag=True, default=False, help="Enable debug output.")
 def mirror(
     config: str,
     source: str | None,
@@ -225,9 +282,14 @@ def mirror(
     interval: int | None,
     ssh_port: int | None,
     mtime_tolerance: float | None,
+    verbose: bool,
 ) -> None:
     """Mirror files from a local directory to a remote Linux host."""
+    global _verbose
+    _verbose = verbose
+
     cfg = load_config(config)
+    debug(f"Loaded config from {config}: {cfg}")
 
     # CLI flags override config file values
     source_dir = source or cfg["source"]
@@ -246,13 +308,18 @@ def mirror(
     console.print(f"[dim]Poll interval: {poll_interval}s | SSH port: {port}[/dim]")
     if excludes:
         console.print(f"[dim]Excludes: {', '.join(excludes)}[/dim]")
+    debug(f"mtime_tolerance={tolerance}s, control_path={_CONTROL_PATH}")
 
     remote_dir_ensured = False
     previous_local_snapshot: dict[str, tuple[float, int]] | None = None
     host_was_reachable = True  # start True so first unreachable message prints
+    cycle = 0
 
     try:
         while True:
+            cycle += 1
+            debug(f"--- Poll cycle {cycle} ---")
+
             if not check_host_reachable(remote_host, port):
                 if host_was_reachable:
                     console.print(
@@ -271,11 +338,12 @@ def mirror(
             try:
                 # Ensure remote base directory exists on first successful connection
                 if not remote_dir_ensured:
-                    subprocess.run(
-                        ["ssh", *_ssh_opts(port), remote_host,
-                         f"mkdir -p {shlex.quote(remote_dest)}"],
-                        check=True,
-                    )
+                    cmd = [
+                        "ssh", *_ssh_opts(port), remote_host,
+                        f"mkdir -p {shlex.quote(remote_dest)}",
+                    ]
+                    debug(f"Ensuring remote dir: {' '.join(cmd)}")
+                    subprocess.run(cmd, check=True)
                     remote_dir_ensured = True
 
                 if previous_local_snapshot is None:
@@ -290,12 +358,28 @@ def mirror(
                     )
                 else:
                     if local_snapshot == previous_local_snapshot:
+                        debug("No local changes detected, sleeping")
                         time.sleep(poll_interval)
                         continue
 
                     console.print(
                         "\n[bold yellow]Changes detected, syncing...[/bold yellow]"
                     )
+                    # Log what changed locally
+                    if _verbose:
+                        added = set(local_snapshot) - set(previous_local_snapshot)
+                        removed = set(previous_local_snapshot) - set(local_snapshot)
+                        modified = {
+                            k for k in set(local_snapshot) & set(previous_local_snapshot)
+                            if local_snapshot[k] != previous_local_snapshot[k]
+                        }
+                        if added:
+                            debug(f"Local added: {sorted(added)}")
+                        if removed:
+                            debug(f"Local removed: {sorted(removed)}")
+                        if modified:
+                            debug(f"Local modified: {sorted(modified)}")
+
                     remote_snapshot = compute_remote_snapshot(
                         remote_host, remote_dest, port,
                     )
@@ -320,6 +404,9 @@ def mirror(
                     )
             except subprocess.CalledProcessError as e:
                 console.print(f"[red]Sync error:[/red] {e}")
+                debug(f"CalledProcessError: cmd={e.cmd}, rc={e.returncode}")
+                if e.stderr:
+                    debug(f"stderr: {e.stderr}")
                 console.print("[dim]Will retry next cycle.[/dim]")
                 time.sleep(poll_interval)
                 continue
