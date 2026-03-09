@@ -146,19 +146,22 @@ def compute_remote_snapshot(
 ) -> dict[str, tuple[float, int]]:
     """SSH into the remote host and stat all files under dest.
 
-    Uses find -printf with null delimiters to handle filenames with newlines.
+    Uses find -printf with newline delimiters. Null delimiters would be more
+    robust for filenames with newlines, but Windows text-mode pipes can drop
+    null bytes.
     """
     cmd = [
         "ssh",
         *_ssh_opts(port),
         host,
-        f"find {shlex.quote(dest)} -type f -printf '%T@ %s %p\\0'",
+        f"find {shlex.quote(dest)} -type f -printf '%T@ %s %p\\n'",
     ]
     debug(f"Remote snapshot cmd: {' '.join(cmd)}")
     t0 = time.monotonic()
     result = subprocess.run(cmd, capture_output=True, text=True)
     elapsed = time.monotonic() - t0
     debug(f"Remote snapshot SSH completed in {elapsed:.3f}s (rc={result.returncode})")
+    debug(f"Remote stdout: {len(result.stdout)} chars")
     if result.returncode != 0:
         if result.stderr.strip():
             console.print(
@@ -169,13 +172,13 @@ def compute_remote_snapshot(
     dest_prefix = dest.rstrip("/") + "/"
     snapshot = {}
     skipped = 0
-    for entry in result.stdout.split("\0"):
-        if not entry:
+    for line in result.stdout.strip().splitlines():
+        if not line:
             continue
-        parts = entry.split(None, 2)
+        parts = line.split(None, 2)
         if len(parts) != 3:
             skipped += 1
-            debug(f"Remote snapshot: skipped unparseable entry: {entry!r}")
+            debug(f"Remote snapshot: skipped unparseable line: {line!r}")
             continue
         mtime_str, size_str, abs_path = parts
         if abs_path.startswith(dest_prefix):
