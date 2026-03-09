@@ -154,7 +154,7 @@ def compute_remote_snapshot(
         "ssh",
         *_ssh_opts(port),
         host,
-        f"find {shlex.quote(dest)} -type f -printf '%T@ %s %p\\n'",
+        f"find -L {shlex.quote(dest)} -type f -printf '%T@ %s %p\\n'",
     ]
     debug(f"Remote snapshot cmd: {' '.join(cmd)}")
     t0 = time.monotonic()
@@ -275,7 +275,7 @@ def delete_remote_files(
     # Clean up empty directories
     cmd = [
         "ssh", *_ssh_opts(port), host,
-        f"find {shlex.quote(dest)} -type d -empty -delete",
+        f"find -L {shlex.quote(dest)} -type d -empty -delete",
     ]
     debug(f"Cleaning empty dirs: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
