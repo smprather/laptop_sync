@@ -360,9 +360,11 @@ def delete_local_files(local_dest: Path, files: list[str]) -> None:
     type=click.Path(exists=True),
     help="Path to YAML config file.",
 )
-@click.option("--source", default=None, help="Override source directory (push).")
+@click.option("--source", default=None, help="Override push source directory.")
 @click.option("--host", default=None, help="Override remote host.")
-@click.option("--dest", default=None, help="Override remote destination directory (push).")
+@click.option("--dest", default=None, help="Override push remote destination directory.")
+@click.option("--pull-source", default=None, help="Override pull remote source directory.")
+@click.option("--pull-dest", default=None, help="Override pull local destination directory.")
 @click.option("--interval", default=None, type=int, help="Override default poll interval (seconds).")
 @click.option("--push-interval", default=None, type=int, help="Override push poll interval (seconds).")
 @click.option("--pull-interval", default=None, type=int, help="Override pull poll interval (seconds).")
@@ -374,6 +376,8 @@ def mirror(
     source: str | None,
     host: str | None,
     dest: str | None,
+    pull_source: str | None,
+    pull_dest: str | None,
     interval: int | None,
     push_interval: int | None,
     pull_interval: int | None,
@@ -409,25 +413,22 @@ def mirror(
             raise click.BadParameter(f"Source directory does not exist: {source_dir}")
 
     # Pull config (optional)
-    pulls_config: list[dict[str, str | Path]] = []
-    for i, entry in enumerate(cfg.get("pulls", [])):
-        if "remote_source" not in entry or "local_dest" not in entry:
-            raise click.UsageError(
-                f"Pull entry {i + 1} must have 'remote_source' and 'local_dest'"
-            )
-        local_dest_path = Path(entry["local_dest"])
-        if not local_dest_path.is_dir():
+    remote_pull_source: str | None = pull_source or cfg.get("pull_source")
+    local_pull_dest: str | None = pull_dest or cfg.get("pull_dest")
+    do_pull = bool(remote_pull_source and local_pull_dest)
+    pull_dest_path: Path | None = None
+    if do_pull:
+        assert remote_pull_source is not None and local_pull_dest is not None
+        pull_dest_path = Path(local_pull_dest)
+        if not pull_dest_path.is_dir():
             raise click.BadParameter(
-                f"Pull local_dest does not exist: {entry['local_dest']}"
+                f"Pull local dest does not exist: {local_pull_dest}"
             )
-        pulls_config.append({
-            "remote_source": entry["remote_source"],
-            "local_dest": local_dest_path,
-        })
 
-    if not do_push and not pulls_config:
+    if not do_push and not do_pull:
         raise click.UsageError(
-            "Config must define 'source'+'dest' (push) and/or 'pulls' (pull)."
+            "Config must define 'source'+'dest' (push) and/or "
+            "'pull_source'+'pull_dest' (pull)."
         )
 
     # Startup banner
@@ -435,9 +436,9 @@ def mirror(
         console.print(
             f"[bold]Push:[/bold] {source_dir} -> {remote_host}:{remote_dest}"
         )
-    for pc in pulls_config:
+    if do_pull:
         console.print(
-            f"[bold]Pull:[/bold] {remote_host}:{pc['remote_source']} -> {pc['local_dest']}"
+            f"[bold]Pull:[/bold] {remote_host}:{remote_pull_source} -> {local_pull_dest}"
         )
     if push_ivl == pull_ivl:
         console.print(f"[dim]Poll interval: {push_ivl}s | SSH port: {port}[/dim]")
@@ -445,7 +446,7 @@ def mirror(
         parts = []
         if do_push:
             parts.append(f"push {push_ivl}s")
-        if pulls_config:
+        if do_pull:
             parts.append(f"pull {pull_ivl}s")
         console.print(f"[dim]Poll intervals: {', '.join(parts)} | SSH port: {port}[/dim]")
     if excludes:
@@ -459,16 +460,13 @@ def mirror(
     push_dir_ensured = False
     previous_push_snapshot: dict[str, tuple[float, int]] | None = None
 
-    # Pull state (per-pull)
-    pull_states: list[dict] = [
-        {"previous_remote_snapshot": None}
-        for _ in pulls_config
-    ]
+    # Pull state
+    previous_pull_snapshot: dict[str, tuple[float, int]] | None = None
 
     host_was_reachable = True
     cycle = 0
     retry_interval = min(push_ivl if do_push else pull_ivl,
-                         pull_ivl if pulls_config else push_ivl)
+                         pull_ivl if do_pull else push_ivl)
     next_push_at = 0.0
     next_pull_at = 0.0
 
@@ -480,7 +478,7 @@ def mirror(
             next_times: list[float] = []
             if do_push:
                 next_times.append(next_push_at)
-            if pulls_config:
+            if do_pull:
                 next_times.append(next_pull_at)
             wait = max(0.0, min(next_times) - now) if next_times else float(retry_interval)
             if wait > 0:
@@ -490,7 +488,7 @@ def mirror(
 
             cycle += 1
             run_push = do_push and now >= next_push_at
-            run_pull = bool(pulls_config) and now >= next_pull_at
+            run_pull = do_pull and now >= next_pull_at
             debug(f"--- Cycle {cycle}: push={'YES' if run_push else 'no'}, pull={'YES' if run_pull else 'no'} ---")
 
             if not run_push and not run_pull:
@@ -599,37 +597,30 @@ def mirror(
                         debug(f"stderr: {e.stderr}")
                 next_push_at = time.monotonic() + push_ivl
 
-            # --- PULLS ---
+            # --- PULL ---
             if run_pull:
-                for i, pull_cfg in enumerate(pulls_config):
-                    remote_source = str(pull_cfg["remote_source"])
-                    local_dest_path = pull_cfg["local_dest"]
-                    assert isinstance(local_dest_path, Path)
-                    label = posixpath.basename(remote_source.rstrip("/"))
+                assert pull_dest_path is not None and remote_pull_source is not None
+                try:
+                    remote_snapshot = compute_remote_snapshot(
+                        remote_host, remote_pull_source, port, excludes,
+                    )
 
-                    try:
-                        remote_snapshot = compute_remote_snapshot(
-                            remote_host, remote_source, port, excludes,
-                        )
-
-                        prev_remote = pull_states[i]["previous_remote_snapshot"]
-                        if prev_remote is not None and remote_snapshot == prev_remote:
-                            debug(f"Pull {label}: no remote changes")
-                            continue
-
-                        if prev_remote is None:
+                    if previous_pull_snapshot is not None and remote_snapshot == previous_pull_snapshot:
+                        debug("Pull: no remote changes")
+                    else:
+                        if previous_pull_snapshot is None:
                             console.print(
-                                f"\n[bold]Pull {label}: first sync, checking "
-                                "consistency with local...[/bold]"
+                                "\n[bold]Pull: first sync, checking consistency "
+                                "with local...[/bold]"
                             )
                         else:
                             console.print(
-                                f"\n[bold yellow]Pull {label}: remote changes "
-                                "detected, syncing...[/bold yellow]"
+                                "\n[bold yellow]Pull: remote changes detected, "
+                                "syncing...[/bold yellow]"
                             )
 
                         local_snapshot = compute_local_snapshot(
-                            local_dest_path, excludes,
+                            pull_dest_path, excludes,
                         )
                         to_copy, to_delete = compute_diff(
                             remote_snapshot, local_snapshot, tolerance,
@@ -637,36 +628,32 @@ def mirror(
 
                         if to_copy:
                             console.print(
-                                f"[cyan]Pull {label}: pulling "
-                                f"{len(to_copy)} file(s)[/cyan]"
+                                f"[cyan]Pull: pulling {len(to_copy)} file(s)[/cyan]"
                             )
                             pull_files(
-                                remote_host, remote_source, port,
-                                local_dest_path, to_copy,
+                                remote_host, remote_pull_source, port,
+                                pull_dest_path, to_copy,
                             )
                         if to_delete:
                             console.print(
-                                f"[red]Pull {label}: deleting "
-                                f"{len(to_delete)} file(s)[/red]"
+                                f"[red]Pull: deleting {len(to_delete)} file(s)[/red]"
                             )
-                            delete_local_files(local_dest_path, to_delete)
+                            delete_local_files(pull_dest_path, to_delete)
 
                         if to_copy or to_delete:
                             console.print(
-                                f"[green]Pull {label} synced:[/green] "
+                                f"[green]Pull synced:[/green] "
                                 f"{len(to_copy)} pulled, {len(to_delete)} deleted"
                             )
-                        elif prev_remote is None:
-                            console.print(
-                                f"[green]Pull {label}: already in sync.[/green]"
-                            )
+                        elif previous_pull_snapshot is None:
+                            console.print("[green]Pull: already in sync.[/green]")
 
-                        pull_states[i]["previous_remote_snapshot"] = remote_snapshot
-                    except subprocess.CalledProcessError as e:
-                        console.print(f"[red]Pull {label} error:[/red] {e}")
-                        debug(f"CalledProcessError: cmd={e.cmd}, rc={e.returncode}")
-                        if e.stderr:
-                            debug(f"stderr: {e.stderr}")
+                        previous_pull_snapshot = remote_snapshot
+                except subprocess.CalledProcessError as e:
+                    console.print(f"[red]Pull error:[/red] {e}")
+                    debug(f"CalledProcessError: cmd={e.cmd}, rc={e.returncode}")
+                    if e.stderr:
+                        debug(f"stderr: {e.stderr}")
                 next_pull_at = time.monotonic() + pull_ivl
     except KeyboardInterrupt:
         console.print("\n[bold]Stopped.[/bold]")

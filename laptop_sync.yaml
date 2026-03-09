@@ -32,10 +32,6 @@ excludes:
   - "node_modules"
   - ".env"
 
-# Pull remote directories to local (optional)
-# Each entry needs remote_source and local_dest (can be a symlink to a dir)
-# pulls:
-#   - remote_source: "/home/user/configs"
-#     local_dest: "C:\\Users\\me\\configs"
-#   - remote_source: "/home/user/scripts"
-#     local_dest: "C:\\Users\\me\\scripts"
+# Pull a remote directory to local (optional, local_dest can be a symlink to a dir)
+# pull_source: "/home/user/configs"
+# pull_dest: "C:\\Users\\me\\configs"

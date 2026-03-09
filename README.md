@@ -36,15 +36,12 @@ excludes:
   - "node_modules"
   - ".env"
 
-# Pull: remote directories → local (optional)
-pulls:
-  - remote_source: "/home/user/configs"
-    local_dest: "C:\\Users\\me\\configs"
-  - remote_source: "/home/user/scripts"
-    local_dest: "C:\\Users\\me\\scripts"
+# Pull: remote directory → local (optional, pull_dest can be a symlink)
+pull_source: "/home/user/configs"
+pull_dest: "C:\\Users\\me\\configs"
 ```
 
-You can configure push only, pull only, or both in the same config. All options except `excludes` and `pulls` can be overridden on the command line.
+You can configure push only, pull only, or both in the same config. All options except `excludes` can be overridden on the command line.
 
 ### Exclude patterns
 
